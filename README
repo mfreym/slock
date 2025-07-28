@@ -22,3 +22,19 @@ Afterwards enter the following command to build and install slock
 Running slock
 -------------
 Simply invoke the 'slock' command. To get out of it, enter your password.
+
+Version
+-------
+1.5
+
+Patches
+-------
+slock-dpms-20231017-4f04554.diff
+slock-squares-1.5.diff
+slock-squares-password-1.5.diff
+slock-user-1.5.diff
+
+Credits
+-------
+This project is based on slock, developed by the suckless 
+community.
