@@ -1,4 +1,5 @@
 /* See LICENSE file for license details. */
+#include <X11/Xmd.h>
 #define _XOPEN_SOURCE 500
 #if HAVE_SHADOW_H
 #include <shadow.h>
@@ -16,6 +17,7 @@
 #include <spawn.h>
 #include <sys/types.h>
 #include <X11/extensions/Xrandr.h>
+#include <X11/extensions/dpms.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -26,6 +28,7 @@
 char *argv0;
 
 enum {
+	BG,
 	INIT,
 	INPUT,
 	FAILED,
@@ -37,6 +40,8 @@ struct lock {
 	Window root, win;
 	Pixmap pmap;
 	unsigned long colors[NUMCOLS];
+	GC gc;
+	XRRScreenResources *rrsr;
 };
 
 struct xrandr {
@@ -126,12 +131,55 @@ gethash(void)
 }
 
 static void
+draw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
+     unsigned int len, unsigned int color)
+{
+	int screen, crtc;
+	XRRCrtcInfo* rrci;
+
+	if (rr->active) {
+		for (screen = 0; screen < nscreens; screen++) {
+			XSetWindowBackground(dpy, locks[screen]->win,locks[screen]->colors[BG]);
+			XClearWindow(dpy, locks[screen]->win);
+			XSetForeground(dpy, locks[screen]->gc, locks[screen]->colors[color]);
+			for (crtc = 0; crtc < locks[screen]->rrsr->ncrtc; ++crtc) {
+				rrci = XRRGetCrtcInfo(dpy,
+				                      locks[screen]->rrsr,
+				                      locks[screen]->rrsr->crtcs[crtc]);
+				/* skip disabled crtc */
+				if (rrci->noutput > 0) {
+					if (len < 1)
+						len = 1;
+					int xoffset = (int) ((squaresize * len) + squarespacing * (len - 1)) / 2;
+					for (int i = 0; i < len; i++)
+						XFillRectangle(dpy,
+						               locks[screen]->win,
+						               locks[screen]->gc,
+						               rrci->x - xoffset + ((rrci->width - squaresize) / 2 ) + ((squaresize + squarespacing) * i),
+						               rrci->y + (rrci->height - squaresize) / 2,
+						               squaresize,
+						               squaresize);
+				}
+				XRRFreeCrtcInfo(rrci);
+			}
+		}
+	} else {
+		for (screen = 0; screen < nscreens; screen++) {
+			XSetWindowBackground(dpy,
+			                     locks[screen]->win,
+			                     locks[screen]->colors[color]);
+			XClearWindow(dpy, locks[screen]->win);
+		}
+	}
+}
+
+static void
 readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
        const char *hash)
 {
 	XRRScreenChangeNotifyEvent *rre;
 	char buf[32], passwd[256], *inputhash;
-	int num, screen, running, failure, oldc;
+	int num, screen, running, failure;
 	unsigned int len, color;
 	KeySym ksym;
 	XEvent ev;
@@ -139,7 +187,6 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 	len = 0;
 	running = 1;
 	failure = 0;
-	oldc = INIT;
 
 	while (running && !XNextEvent(dpy, &ev)) {
 		if (ev.type == KeyPress) {
@@ -189,14 +236,8 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 				break;
 			}
 			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
-			if (running && oldc != color) {
-				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
-					XClearWindow(dpy, locks[screen]->win);
-				}
-				oldc = color;
+			if (running) {
+				draw(dpy, rr, locks, nscreens, len, color);
 			}
 		} else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
 			rre = (XRRScreenChangeNotifyEvent*)&ev;
@@ -229,6 +270,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	XColor color, dummy;
 	XSetWindowAttributes wa;
 	Cursor invisible;
+	XGCValues gcvalues;
 
 	if (dpy == NULL || screen < 0 || !(lock = malloc(sizeof(struct lock))))
 		return NULL;
@@ -244,7 +286,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 
 	/* init */
 	wa.override_redirect = 1;
-	wa.background_pixel = lock->colors[INIT];
+	wa.background_pixel = lock->colors[BG];
 	lock->win = XCreateWindow(dpy, lock->root, 0, 0,
 	                          DisplayWidth(dpy, lock->screen),
 	                          DisplayHeight(dpy, lock->screen),
@@ -256,6 +298,10 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
 	                                &color, &color, 0, 0);
 	XDefineCursor(dpy, lock->win, invisible);
+	lock->gc = XCreateGC(dpy, lock->win, 0, &gcvalues);
+	XSetForeground(dpy, lock->gc, lock->colors[INIT]);
+	if (rr->active)
+		lock->rrsr = XRRGetScreenResourcesCurrent(dpy, lock->root);
 
 	/* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
 	for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {
@@ -315,6 +361,8 @@ main(int argc, char **argv) {
 	const char *hash;
 	Display *dpy;
 	int s, nlocks, nscreens;
+	CARD16 standby, suspend, off;
+	BOOL dpms_state;
 
 	ARGBEGIN {
 	case 'v':
@@ -326,13 +374,13 @@ main(int argc, char **argv) {
 
 	/* validate drop-user and -group */
 	errno = 0;
-	if (!(pwd = getpwnam(user)))
-		die("slock: getpwnam %s: %s\n", user,
+	if (!(pwd = getpwnam(getenv("USER"))))
+		die("slock: getpwnam %s: %s\n", getenv("USER"),
 		    errno ? strerror(errno) : "user entry not found");
 	duid = pwd->pw_uid;
 	errno = 0;
-	if (!(grp = getgrnam(group)))
-		die("slock: getgrnam %s: %s\n", group,
+	if (!(grp = getgrnam(getenv("USER"))))
+		die("slock: getgrnam %s: %s\n", getenv("USER"),
 		    errno ? strerror(errno) : "group entry not found");
 	dgid = grp->gr_gid;
 
@@ -375,6 +423,22 @@ main(int argc, char **argv) {
 	if (nlocks != nscreens)
 		return 1;
 
+	/* DPMS magic to disable the monitor */
+	if (!DPMSCapable(dpy))
+		die("slock: DPMSCapable failed\n");
+	if (!DPMSInfo(dpy, &standby, &dpms_state))
+		die("slock: DPMSInfo failed\n");
+	if (!DPMSEnable(dpy) && !dpms_state)
+		die("slock: DPMSEnable failed\n");
+	if (!DPMSGetTimeouts(dpy, &standby, &suspend, &off))
+		die("slock: DPMSGetTimeouts failed\n");
+	if (!standby || !suspend || !off)
+		die("slock: at least one DPMS variable is zero\n");
+	if (!DPMSSetTimeouts(dpy, monitortime, monitortime, monitortime))
+		die("slock: DPMSSetTimeouts failed\n");
+
+	XSync(dpy, 0);
+
 	/* run post-lock command */
 	if (argc > 0) {
 		pid_t pid;
@@ -386,8 +450,17 @@ main(int argc, char **argv) {
 		}
 	}
 
+	/* draw the initial rectangle */
+	draw(dpy, &rr, locks, nscreens, 0, INIT);
+
 	/* everything is now blank. Wait for the correct password */
 	readpw(dpy, &rr, locks, nscreens, hash);
+
+	/* reset DPMS values to inital ones */
+	DPMSSetTimeouts(dpy, standby, suspend, off);
+	if (!dpms_state)
+		DPMSDisable(dpy);
+	XSync(dpy, 0);
 
 	return 0;
 }
