@@ -16,3 +16,6 @@ static const int squaresize = 50;
 
 /* spacing between squares in px */
 static const int squarespacing = 10;
+
+#define BLUR
+static const int blurRadius=25;
